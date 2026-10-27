@@ -190,7 +190,7 @@ export function createProgram(overrides?: Partial<AppConfig>): Command {
     .command("keeper:start")
     .description("Start the long-running keeper monitoring daemon")
     .action(async () => {
-      const { config, logger, monitoringService } = initContext();
+      const { config, logger, monitoringService, db } = initContext();
       const keeper = new KeeperDaemon({
         monitoringService,
         logger,
@@ -199,14 +199,46 @@ export function createProgram(overrides?: Partial<AppConfig>): Command {
 
       keeper.start();
 
-      const shutdown = async () => {
-        console.log("\nShutdown signal caught. Stopping keeper...");
-        await keeper.stop();
-        process.exit(0);
+      let isShuttingDown = false;
+      const shutdown = async (signal: string) => {
+        if (isShuttingDown) return;
+        isShuttingDown = true;
+        logger.info({ signal }, "Shutdown signal received. Performing graceful keeper cleanup...");
+        try {
+          await keeper.stop();
+          db.close();
+          logger.info("Keeper resources closed cleanly.");
+          process.exit(0);
+        } catch (err) {
+          logger.error({ err }, "Error during keeper shutdown");
+          db.close();
+          process.exit(1);
+        }
       };
 
-      process.on("SIGINT", shutdown);
-      process.on("SIGTERM", shutdown);
+      process.on("SIGINT", () => void shutdown("SIGINT"));
+      process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+      // Process fatal exception handlers
+      process.on("uncaughtException", (err: Error) => {
+        logger.fatal(
+          { err: { message: err.message, stack: err.stack } },
+          "Uncaught exception in keeper process. Halting.",
+        );
+        try {
+          keeper.stop().finally(() => {
+            db.close();
+            process.exit(1);
+          });
+        } catch {
+          process.exit(1);
+        }
+      });
+
+      process.on("unhandledRejection", (reason: unknown) => {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        logger.error({ reason: message }, "Unhandled promise rejection in keeper process");
+      });
     });
 
   // 7. alerts:list
@@ -220,13 +252,57 @@ export function createProgram(overrides?: Partial<AppConfig>): Command {
         const alerts = db.listAlerts(Number(opts.limit));
         console.log(`--- Recent Alerts (${alerts.length}) ---`);
         for (const a of alerts) {
-          console.log(`[${a.createdAt}] [${a.category.toUpperCase()}] ${a.title}`);
+          const status = a.deliveryStatus
+            ? `[${a.deliveryStatus.toUpperCase()}]`
+            : a.delivered
+              ? "[DELIVERED]"
+              : "[PENDING]";
+          console.log(`[${a.createdAt}] [${a.category.toUpperCase()}] ${status} ${a.title}`);
           console.log(`  ${a.message}`);
+          if (a.lastDeliveryError) {
+            console.log(`  Last Delivery Error: ${a.lastDeliveryError}`);
+          }
         }
         db.close();
         process.exitCode = 0;
       } catch (err) {
         console.error(`[Error]: ${err instanceof Error ? err.message : String(err)}`);
+        db.close();
+        process.exitCode = 1;
+      }
+    });
+
+  // 8. db:prune
+  program
+    .command("db:prune")
+    .description(
+      "Prune historical observations and delivered alerts older than the specified retention window",
+    )
+    .option("--observations-days <days>", "Retention days for TTL observations", "14")
+    .option(
+      "--alerts-days <days>",
+      "Retention days for delivered alerts (undelivered alerts are never pruned)",
+      "30",
+    )
+    .action((opts) => {
+      const { db } = initContext();
+      try {
+        const obsDays = Number(opts.observationsDays);
+        const alertDays = Number(opts.alertsDays);
+
+        const obsCutoff = new Date(Date.now() - obsDays * 86400000).toISOString();
+        const alertCutoff = new Date(Date.now() - alertDays * 86400000).toISOString();
+
+        const prunedObs = db.pruneObservations(obsCutoff);
+        const prunedAlerts = db.pruneAlerts(alertCutoff);
+
+        console.log(`[Retention Pruning Complete]`);
+        console.log(`  Observations pruned (older than ${obsDays}d): ${prunedObs}`);
+        console.log(`  Delivered alerts pruned (older than ${alertDays}d): ${prunedAlerts}`);
+        db.close();
+        process.exitCode = 0;
+      } catch (err) {
+        console.error(`[Prune Error]: ${err instanceof Error ? err.message : String(err)}`);
         db.close();
         process.exitCode = 1;
       }

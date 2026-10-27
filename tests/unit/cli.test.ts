@@ -36,6 +36,7 @@ describe("CLI Commands", () => {
     expect(commandNames).toContain("monitor:once");
     expect(commandNames).toContain("keeper:start");
     expect(commandNames).toContain("alerts:list");
+    expect(commandNames).toContain("db:prune");
   });
 
   it("prints version and help without throwing unhandled exceptions", async () => {

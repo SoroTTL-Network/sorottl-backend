@@ -103,4 +103,27 @@ describe("KeeperDaemon Lifecycle", () => {
     await vi.advanceTimersByTimeAsync(6000);
     await startPromise;
   });
+
+  it("handles unhandled exception during monitoring cycle without crashing daemon", async () => {
+    const errorSpy = vi.fn().mockRejectedValue(new Error("Fatal cycle panic"));
+    const mockService = {
+      runMonitoringCycle: errorSpy,
+    } as unknown as MonitoringService;
+
+    const keeper = new KeeperDaemon({
+      monitoringService: mockService,
+      logger,
+      intervalMs: 1000,
+    });
+
+    keeper.start();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+
+    // Daemon should still remain running despite exception in cycle
+    expect(keeper.isRunning()).toBe(true);
+
+    keeper.stop();
+    expect(keeper.isRunning()).toBe(false);
+  });
 });
