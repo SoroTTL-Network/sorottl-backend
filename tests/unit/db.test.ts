@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { DatabaseClient } from "../../src/db/client.js";
 
@@ -244,10 +245,104 @@ describe("SQLite Database Client", () => {
 
       try {
         expect(() => new DatabaseClient(tempDbPath)).toThrow(/newer than supported version/i);
+        // Verify future database file remained unchanged after rejection
+        const verifyClient = new DatabaseSync(tempDbPath);
+        const row = verifyClient.prepare("PRAGMA user_version;").get() as { user_version: number };
+        expect(row.user_version).toBe(99);
+        verifyClient.close();
       } finally {
         if (fs.existsSync(tempDbPath)) {
           fs.rmSync(tempDbPath, { force: true });
         }
+      }
+    });
+
+    it("migrates a Phase 7 (v1) schema database transactionally to v2", () => {
+      const tempDbPath = path.resolve(process.cwd(), "tmp_v1_migration.db");
+      if (fs.existsSync(tempDbPath)) {
+        fs.rmSync(tempDbPath, { force: true });
+      }
+
+      // 1. Manually create a Phase 7 v1 database
+      const rawDb = new DatabaseSync(tempDbPath);
+      rawDb.exec(`
+        PRAGMA user_version = 1;
+        CREATE TABLE watchlist (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          network TEXT NOT NULL,
+          label TEXT NOT NULL,
+          key_type TEXT NOT NULL,
+          key_xdr TEXT NOT NULL,
+          contract_id TEXT,
+          warning_threshold_ledgers INTEGER NOT NULL DEFAULT 5000,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(network, key_xdr)
+        );
+        CREATE TABLE alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          watchlist_id INTEGER,
+          network TEXT NOT NULL,
+          category TEXT NOT NULL,
+          title TEXT NOT NULL,
+          message TEXT NOT NULL,
+          payload_json TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          delivered INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO alerts (network, category, title, message, delivered)
+        VALUES ('testnet', 'low_ttl', 'Legacy Alert', 'Legacy Message', 0);
+      `);
+      rawDb.close();
+
+      // 2. Open via DatabaseClient - should run migration v2
+      const client = new DatabaseClient(tempDbPath);
+      try {
+        const alerts = client.listAlerts(10);
+        expect(alerts).toHaveLength(1);
+        expect(alerts[0]?.title).toBe("Legacy Alert");
+        expect(alerts[0]?.deliveryStatus).toBe("pending");
+        expect(alerts[0]?.deliveryAttempts).toBe(0);
+
+        // Verify version advanced to 2
+        expect(client["getSchemaVersion"]()).toBe(2);
+      } finally {
+        client.close();
+        if (fs.existsSync(tempDbPath)) {
+          fs.rmSync(tempDbPath, { force: true });
+        }
+      }
+    });
+
+    it("rolls back schema migration and preserves user_version if a migration step fails", () => {
+      const tempDbPath = path.resolve(process.cwd(), "tmp_failed_migration.db");
+      if (fs.existsSync(tempDbPath)) {
+        fs.rmSync(tempDbPath, { force: true });
+      }
+
+      const rawDb = new DatabaseSync(tempDbPath);
+      rawDb.exec("PRAGMA user_version = 1;");
+      // Create table with conflicting column or lock that causes failure in v2 migration
+      rawDb.exec(`
+        CREATE TABLE alerts (
+          id INTEGER PRIMARY KEY,
+          delivery_status INTEGER -- Conflicting type / existing column
+        );
+      `);
+      rawDb.close();
+
+      // Opening DatabaseClient should fail during ALTER TABLE ADD COLUMN delivery_status
+      expect(() => new DatabaseClient(tempDbPath)).toThrow();
+
+      // Verify transaction rolled back and user_version was NOT bumped to 2
+      const verifyDb = new DatabaseSync(tempDbPath);
+      const row = verifyDb.prepare("PRAGMA user_version;").get() as { user_version: number };
+      expect(row.user_version).toBe(1);
+      verifyDb.close();
+
+      if (fs.existsSync(tempDbPath)) {
+        fs.rmSync(tempDbPath, { force: true });
       }
     });
   });

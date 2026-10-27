@@ -67,66 +67,80 @@ export class DatabaseClient {
 
     // Migration v1: Initial tables
     if (currentVersion < 1) {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS watchlist (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          network TEXT NOT NULL,
-          label TEXT NOT NULL,
-          key_type TEXT NOT NULL,
-          key_xdr TEXT NOT NULL,
-          contract_id TEXT,
-          warning_threshold_ledgers INTEGER NOT NULL DEFAULT 5000,
-          enabled INTEGER NOT NULL DEFAULT 1,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-          UNIQUE(network, key_xdr)
-        );
-        CREATE INDEX IF NOT EXISTS idx_watchlist_network_enabled ON watchlist(network, enabled);
+      this.db.exec("BEGIN IMMEDIATE TRANSACTION;");
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            network TEXT NOT NULL,
+            label TEXT NOT NULL,
+            key_type TEXT NOT NULL,
+            key_xdr TEXT NOT NULL,
+            contract_id TEXT,
+            warning_threshold_ledgers INTEGER NOT NULL DEFAULT 5000,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(network, key_xdr)
+          );
+          CREATE INDEX IF NOT EXISTS idx_watchlist_network_enabled ON watchlist(network, enabled);
 
-        CREATE TABLE IF NOT EXISTS ttl_observations (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          watchlist_id INTEGER NOT NULL REFERENCES watchlist(id) ON DELETE CASCADE,
-          network TEXT NOT NULL,
-          current_ledger INTEGER NOT NULL,
-          live_until_ledger_seq INTEGER,
-          remaining_ledgers INTEGER,
-          last_modified_ledger_seq INTEGER,
-          status TEXT NOT NULL,
-          durability TEXT NOT NULL,
-          confidence TEXT NOT NULL,
-          reason TEXT,
-          observed_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_observations_watchlist_id ON ttl_observations(watchlist_id);
-        CREATE INDEX IF NOT EXISTS idx_observations_observed_at ON ttl_observations(observed_at);
+          CREATE TABLE IF NOT EXISTS ttl_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            watchlist_id INTEGER NOT NULL REFERENCES watchlist(id) ON DELETE CASCADE,
+            network TEXT NOT NULL,
+            current_ledger INTEGER NOT NULL,
+            live_until_ledger_seq INTEGER,
+            remaining_ledgers INTEGER,
+            last_modified_ledger_seq INTEGER,
+            status TEXT NOT NULL,
+            durability TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            reason TEXT,
+            observed_at TEXT NOT NULL DEFAULT (datetime('now'))
+          );
+          CREATE INDEX IF NOT EXISTS idx_observations_watchlist_id ON ttl_observations(watchlist_id);
+          CREATE INDEX IF NOT EXISTS idx_observations_observed_at ON ttl_observations(observed_at);
 
-        CREATE TABLE IF NOT EXISTS alerts (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          watchlist_id INTEGER REFERENCES watchlist(id) ON DELETE SET NULL,
-          network TEXT NOT NULL,
-          category TEXT NOT NULL,
-          title TEXT NOT NULL,
-          message TEXT NOT NULL,
-          payload_json TEXT,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          delivered INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_alerts_watchlist_category ON alerts(watchlist_id, category);
-        CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);
-      `);
-      this.setSchemaVersion(1);
+          CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            watchlist_id INTEGER REFERENCES watchlist(id) ON DELETE SET NULL,
+            network TEXT NOT NULL,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            payload_json TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            delivered INTEGER NOT NULL DEFAULT 0
+          );
+          CREATE INDEX IF NOT EXISTS idx_alerts_watchlist_category ON alerts(watchlist_id, category);
+          CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);
+        `);
+        this.setSchemaVersion(1);
+        this.db.exec("COMMIT;");
+      } catch (err) {
+        this.db.exec("ROLLBACK;");
+        throw err;
+      }
     }
 
     // Migration v2: Explicit delivery status, attempts, and retention indexes
     if (currentVersion < 2) {
-      this.db.exec(`
-        ALTER TABLE alerts ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'pending';
-        ALTER TABLE alerts ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE alerts ADD COLUMN last_delivery_error TEXT;
-        ALTER TABLE alerts ADD COLUMN delivered_at TEXT;
-        CREATE INDEX IF NOT EXISTS idx_alerts_delivery_status ON alerts(delivery_status);
-      `);
-      this.setSchemaVersion(2);
+      this.db.exec("BEGIN IMMEDIATE TRANSACTION;");
+      try {
+        this.db.exec(`
+          ALTER TABLE alerts ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'pending';
+          ALTER TABLE alerts ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE alerts ADD COLUMN last_delivery_error TEXT;
+          ALTER TABLE alerts ADD COLUMN delivered_at TEXT;
+          CREATE INDEX IF NOT EXISTS idx_alerts_delivery_status ON alerts(delivery_status);
+        `);
+        this.setSchemaVersion(2);
+        this.db.exec("COMMIT;");
+      } catch (err) {
+        this.db.exec("ROLLBACK;");
+        throw err;
+      }
     }
   }
 
@@ -359,6 +373,31 @@ export class DatabaseClient {
 
     const res = stmt.run(status, isDelivered, errorMessage ?? null, deliveredAt, alertId);
     return res.changes > 0;
+  }
+
+  /**
+   * Retrieves pending or retryable failed alerts for webhook reconciliation.
+   * Deterministically ordered by id ASC to preserve FIFO delivery sequence.
+   *
+   * @param limit - Maximum number of alerts to return (default: 50)
+   * @param maxAttempts - Maximum attempts before an alert is considered permanently exhausted (default: 5)
+   */
+  public getEligiblePendingAlerts(limit: number = 50, maxAttempts: number = 5): AlertRecord[] {
+    const stmt = this.db.prepare(`
+      SELECT id, watchlist_id as watchlistId, network, category, title, message,
+             payload_json as payloadJson, created_at as createdAt, delivered,
+             delivery_status as deliveryStatus, delivery_attempts as deliveryAttempts,
+             last_delivery_error as lastDeliveryError, delivered_at as deliveredAt
+      FROM alerts
+      WHERE delivery_status IN ('pending', 'failed')
+        AND delivered = 0
+        AND delivery_attempts < ?
+      ORDER BY id ASC
+      LIMIT ?;
+    `);
+
+    const rows = stmt.all(maxAttempts, limit) as Record<string, unknown>[];
+    return rows.map((r) => this.mapAlertRow(r));
   }
 
   /**
