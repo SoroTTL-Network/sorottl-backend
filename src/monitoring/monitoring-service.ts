@@ -8,6 +8,8 @@ import type { DatabaseClient } from "../db/client.js";
 import type { Logger } from "../logging/logger.js";
 import type { AlertCategory, MonitoringCycleSummary, WatchlistRecord } from "../types/domain.js";
 import { reconstructLedgerKey } from "../watchlist/key-reconstructor.js";
+import { mapConcurrent } from "./concurrency.js";
+import { withRetry } from "./retry.js";
 
 export interface MonitoringServiceOptions {
   readonly db: DatabaseClient;
@@ -16,6 +18,8 @@ export interface MonitoringServiceOptions {
   readonly network: string;
   readonly alertCooldownMs?: number | undefined;
   readonly alertWebhookUrl?: string | undefined;
+  /** Maximum concurrent RPC queries for ledger entries (default: 5) */
+  readonly concurrency?: number | undefined;
 }
 
 /**
@@ -28,6 +32,7 @@ export class MonitoringService {
   private readonly network: string;
   private readonly alertCooldownMs: number;
   private readonly alertWebhookUrl?: string | undefined;
+  private readonly concurrency: number;
 
   constructor(options: MonitoringServiceOptions) {
     this.db = options.db;
@@ -36,6 +41,7 @@ export class MonitoringService {
     this.network = options.network;
     this.alertCooldownMs = options.alertCooldownMs ?? 1800000;
     this.alertWebhookUrl = options.alertWebhookUrl;
+    this.concurrency = options.concurrency ?? 5;
   }
 
   /**
@@ -69,10 +75,15 @@ export class MonitoringService {
       };
     }
 
-    // 2. Fetch current ledger sequence snapshot via SDK
+    // 2. Fetch current ledger sequence snapshot via SDK with transient retry
     let currentLedger: number;
     try {
-      currentLedger = await this.rpcClient.getLatestLedgerSequence();
+      currentLedger = await withRetry(() => this.rpcClient.getLatestLedgerSequence(), {
+        maxAttempts: 3,
+        initialDelayMs: 250,
+        maxDelayMs: 2000,
+        maxTotalTimeoutMs: 6000,
+      });
       this.logger.debug({ cycleId, currentLedger }, "Retrieved current ledger sequence snapshot");
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
@@ -100,23 +111,11 @@ export class MonitoringService {
     let errorCount = 0;
     let alertsTriggered = 0;
 
-    // 3. Process each watchlist entry independently (per-key failure isolation)
-    for (const item of watchlist) {
+    // 3. Process watchlist entries concurrently with bounded worker pool (per-key failure isolation)
+    const results = await mapConcurrent(watchlist, this.concurrency, async (item) => {
       try {
-        const itemResult = await this.processWatchlistItem(item, currentLedger);
-        alertsTriggered += itemResult.alertsCount;
-
-        if (itemResult.isError) {
-          errorCount++;
-        } else {
-          // Tally latest classification
-          const latestObs = this.db.getLatestObservation(item.id);
-          if (latestObs?.status === "live") liveCount++;
-          else if (latestObs?.status === "ttlReached") ttlReachedCount++;
-          else unknownCount++;
-        }
+        return await this.processWatchlistItem(item, currentLedger);
       } catch (err) {
-        errorCount++;
         const errorMsg = err instanceof Error ? err.message : String(err);
         this.logger.error(
           { watchlistId: item.id, label: item.label, err },
@@ -128,7 +127,23 @@ export class MonitoringService {
           `Key Processing Failed: ${item.label}`,
           errorMsg,
         );
-        if (triggered) alertsTriggered++;
+        return { alertsCount: triggered ? 1 : 0, isError: true, watchlistId: item.id };
+      }
+    });
+
+    for (let i = 0; i < watchlist.length; i++) {
+      const item = watchlist[i]!;
+      const itemResult = results[i]!;
+      alertsTriggered += itemResult.alertsCount;
+
+      if (itemResult.isError) {
+        errorCount++;
+      } else {
+        // Tally latest classification from DB
+        const latestObs = this.db.getLatestObservation(item.id);
+        if (latestObs?.status === "live") liveCount++;
+        else if (latestObs?.status === "ttlReached") ttlReachedCount++;
+        else unknownCount++;
       }
     }
 
@@ -163,10 +178,15 @@ export class MonitoringService {
     // 1. Reconstruct SDK xdr.LedgerKey
     const { key } = reconstructLedgerKey(item.keyType, item.keyXdr, item.contractId);
 
-    // 2. Query ledger entry through SDK RPC client
+    // 2. Query ledger entry through SDK RPC client with transient retry
     let entry;
     try {
-      entry = await this.rpcClient.getLedgerEntry(key);
+      entry = await withRetry(() => this.rpcClient.getLedgerEntry(key), {
+        maxAttempts: 3,
+        initialDelayMs: 200,
+        maxDelayMs: 1500,
+        maxTotalTimeoutMs: 5000,
+      });
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       this.logger.warn(
@@ -257,7 +277,7 @@ export class MonitoringService {
 
     this.logger.warn({ watchlistId, category, title }, "Triggering alert");
 
-    this.db.recordAlert({
+    const alertRecord = this.db.recordAlert({
       watchlistId: item?.id ?? null,
       network: this.network,
       category,
@@ -270,31 +290,63 @@ export class MonitoringService {
       }),
     });
 
-    // Optional external webhook dispatch
+    // Optional external webhook dispatch with explicit delivery tracking
     if (this.alertWebhookUrl) {
-      this.dispatchWebhook(title, message).catch((err) => {
-        this.logger.error({ err }, "Failed to dispatch alert webhook");
+      this.dispatchWebhook(alertRecord.id, title, message).catch((err) => {
+        this.logger.error({ alertId: alertRecord.id, err }, "Failed to dispatch alert webhook");
       });
     }
 
     return true;
   }
 
-  private async dispatchWebhook(title: string, message: string): Promise<void> {
-    if (!this.alertWebhookUrl) return;
+  /**
+   * Dispatches alert payload to configured webhook endpoint with bounded retries,
+   * timeout (5000ms), and updates SQLite delivery status.
+   */
+  public async dispatchWebhook(alertId: number, title: string, message: string): Promise<boolean> {
+    if (!this.alertWebhookUrl) return false;
+
+    const payload = JSON.stringify({
+      network: this.network,
+      alertId,
+      title,
+      message,
+      timestamp: new Date().toISOString(),
+    });
+
     try {
-      await fetch(this.alertWebhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          network: this.network,
-          title,
-          message,
-          timestamp: new Date().toISOString(),
-        }),
-      });
+      await withRetry(
+        async () => {
+          const response = await fetch(this.alertWebhookUrl!, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: payload,
+            signal: AbortSignal.timeout(5000),
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status} ${response.statusText}`);
+          }
+          return response;
+        },
+        {
+          maxAttempts: 3,
+          initialDelayMs: 300,
+          maxDelayMs: 2000,
+          maxTotalTimeoutMs: 6000,
+        },
+      );
+
+      // Record successful delivery
+      this.db.updateAlertDelivery(alertId, "delivered");
+      this.logger.debug({ alertId }, "Webhook delivered successfully");
+      return true;
     } catch (err) {
-      this.logger.error({ err }, "Webhook fetch failure");
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      this.db.updateAlertDelivery(alertId, "failed", errorMsg);
+      this.logger.warn({ alertId, errorMsg }, "Webhook delivery failed after retries");
+      return false;
     }
   }
 }

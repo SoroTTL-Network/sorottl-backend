@@ -16,3 +16,5 @@ export * from "./db/client.js";
 export * from "./watchlist/key-reconstructor.js";
 export * from "./monitoring/monitoring-service.js";
 export * from "./monitoring/keeper.js";
+export * from "./monitoring/retry.js";
+export * from "./monitoring/concurrency.js";

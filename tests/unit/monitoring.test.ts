@@ -208,4 +208,174 @@ describe("MonitoringService", () => {
     expect(summary.totalKeys).toBe(1);
     expect(summary.errorKeys).toBe(1);
   });
+
+  it("retries transient RPC failures on getLatestLedgerSequence before succeeding", async () => {
+    let callCount = 0;
+    const mockRpc: ISoroRpcClient = {
+      getLatestLedger: vi.fn(),
+      getLatestLedgerSequence: vi.fn().mockImplementation(async () => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error("HTTP 503 Service Unavailable");
+        }
+        return 12345;
+      }),
+      getLedgerEntry: vi.fn(),
+      getLedgerEntries: vi.fn(),
+      getLedgerEntriesBatch: vi.fn(),
+      simulateTransaction: vi.fn(),
+      sendTransaction: vi.fn(),
+      getTransaction: vi.fn(),
+      getHealth: vi.fn(),
+    };
+
+    const service = new MonitoringService({
+      db,
+      rpcClient: mockRpc,
+      logger,
+      network: "testnet",
+    });
+
+    // Add 1 entry to trigger sequence check
+    const recon = reconstructLedgerKey({ keyType: "instance", contractId });
+    db.addWatchlistEntry({
+      network: "testnet",
+      label: "Retry Test",
+      keyType: "instance",
+      keyXdr: recon.keyXdr,
+      contractId,
+    });
+
+    const summary = await service.runMonitoringCycle();
+    expect(callCount).toBe(2); // Failed once, then retried and succeeded
+    expect(summary.errorKeys).toBe(0);
+    expect(mockRpc.getLatestLedgerSequence).toHaveBeenCalledTimes(2);
+  });
+
+  it("processes multiple keys concurrently with bounded worker pool", async () => {
+    const recon1 = reconstructLedgerKey({ keyType: "instance", contractId });
+    db.addWatchlistEntry({
+      network: "testnet",
+      label: "Concurrent 1",
+      keyType: "instance",
+      keyXdr: recon1.keyXdr,
+      contractId,
+    });
+
+    const recon2 = reconstructLedgerKey({
+      keyType: "contractCode",
+      wasmHashHex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    db.addWatchlistEntry({
+      network: "testnet",
+      label: "Concurrent 2",
+      keyType: "contractCode",
+      keyXdr: recon2.keyXdr,
+    });
+
+    let activeConcurrentQueries = 0;
+    let peakConcurrency = 0;
+
+    const mockRpc: ISoroRpcClient = {
+      getLatestLedger: vi.fn(),
+      getLatestLedgerSequence: vi.fn().mockResolvedValue(2000),
+      getLedgerEntry: vi.fn().mockImplementation(async () => {
+        activeConcurrentQueries++;
+        peakConcurrency = Math.max(peakConcurrency, activeConcurrentQueries);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        activeConcurrentQueries--;
+        return {
+          key: recon1.key,
+          liveUntilLedgerSeq: 3000,
+          entryType: "contractData",
+        };
+      }),
+      getLedgerEntries: vi.fn(),
+      getLedgerEntriesBatch: vi.fn(),
+      simulateTransaction: vi.fn(),
+      sendTransaction: vi.fn(),
+      getTransaction: vi.fn(),
+      getHealth: vi.fn(),
+    };
+
+    const service = new MonitoringService({
+      db,
+      rpcClient: mockRpc,
+      logger,
+      network: "testnet",
+      concurrency: 2,
+    });
+
+    const summary = await service.runMonitoringCycle();
+    expect(summary.totalKeys).toBe(2);
+    expect(summary.liveKeys).toBe(2);
+    expect(peakConcurrency).toBeGreaterThanOrEqual(1);
+    expect(peakConcurrency).toBeLessThanOrEqual(2);
+  });
+
+  it("handles webhook delivery with retries, timeout, and updates delivery status", async () => {
+    const entry = db.addWatchlistEntry({
+      network: "testnet",
+      label: "Webhook Test Item",
+      keyType: "instance",
+      keyXdr: "AAAAFA==",
+    });
+
+    const alert = db.recordAlert({
+      watchlistId: entry.id,
+      network: "testnet",
+      category: "low_ttl",
+      title: "Test Webhook Alert",
+      message: "Webhook testing",
+    });
+
+    let fetchCalls = 0;
+    // Mock global fetch
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async () => {
+      fetchCalls++;
+      if (fetchCalls === 1) {
+        throw new Error("HTTP 502 Bad Gateway");
+      }
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+      };
+    });
+
+    try {
+      const mockRpc: ISoroRpcClient = {
+        getLatestLedger: vi.fn(),
+        getLatestLedgerSequence: vi.fn().mockResolvedValue(100),
+        getLedgerEntry: vi.fn(),
+        getLedgerEntries: vi.fn(),
+        getLedgerEntriesBatch: vi.fn(),
+        simulateTransaction: vi.fn(),
+        sendTransaction: vi.fn(),
+        getTransaction: vi.fn(),
+        getHealth: vi.fn(),
+      };
+
+      const service = new MonitoringService({
+        db,
+        rpcClient: mockRpc,
+        logger,
+        network: "testnet",
+        alertWebhookUrl: "https://example.com/webhook",
+      });
+
+      const delivered = await service.dispatchWebhook(alert.id, alert.title, alert.message);
+      expect(delivered).toBe(true);
+      expect(fetchCalls).toBe(2); // Retried once on 502 and succeeded
+
+      // Verify SQLite delivery update
+      const updatedAlert = db.listAlerts({ watchlistId: entry.id })[0];
+      expect(updatedAlert?.deliveryStatus).toBe("delivered");
+      expect(updatedAlert?.delivered).toBe(true);
+      expect(updatedAlert?.deliveredAt).toBeDefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
