@@ -44,7 +44,7 @@ function requestRaw(
   url: string,
   method: string,
   headers: Record<string, string> = {},
-): Promise<{ status: number; body: string }> {
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const req = http.request(
@@ -58,7 +58,9 @@ function requestRaw(
       (res) => {
         let data = "";
         res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => resolve({ status: res.statusCode || 0, body: data }));
+        res.on("end", () =>
+          resolve({ status: res.statusCode || 0, body: data, headers: res.headers }),
+        );
       },
     );
     req.on("error", reject);
@@ -325,7 +327,110 @@ describe("HttpServer Read-Only API", () => {
     });
   });
 
-  describe("Security and Protocol Invariants", () => {
+  describe("CORS and Security Invariants", () => {
+    it("does not emit Access-Control-Allow-Origin header when corsOrigin is unset", async () => {
+      // server default in beforeEach has no corsOrigin
+      const res = await requestRaw(`${baseUrl}/api/v1/watchlist`, "GET", {
+        Origin: "https://malicious.example.com",
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+    });
+
+    it("emits configured corsOrigin and does not echo arbitrary disallowed origins", async () => {
+      const corsServer = new HttpServer({
+        db,
+        rpcClient: mockRpc,
+        logger,
+        port: 0,
+        host: "127.0.0.1",
+        corsOrigin: "https://trusted-dashboard.example.com",
+      });
+      const bound = await corsServer.start();
+      const testUrl = `http://127.0.0.1:${bound.port}`;
+
+      try {
+        // Request from unauthorized origin still only gets the configured trusted origin
+        const res = await requestRaw(`${testUrl}/api/v1/watchlist`, "GET", {
+          Origin: "https://untrusted.attacker.com",
+        });
+        expect(res.status).toBe(200);
+        expect(res.headers["access-control-allow-origin"]).toBe(
+          "https://trusted-dashboard.example.com",
+        );
+
+        // Preflight OPTIONS request
+        const optionsRes = await requestRaw(`${testUrl}/api/v1/watchlist`, "OPTIONS", {
+          Origin: "https://untrusted.attacker.com",
+        });
+        expect(optionsRes.status).toBe(204);
+        expect(optionsRes.headers["access-control-allow-origin"]).toBe(
+          "https://trusted-dashboard.example.com",
+        );
+      } finally {
+        await corsServer.stop();
+      }
+    });
+
+    it("does not leak secret tokens or internal database errors in error responses", async () => {
+      const secretToken = "super-secret-token-xyz-12345";
+      const secureServer = new HttpServer({
+        db,
+        logger,
+        port: 0,
+        host: "127.0.0.1",
+        authToken: secretToken,
+      });
+      const bound = await secureServer.start();
+      const testUrl = `http://127.0.0.1:${bound.port}`;
+
+      try {
+        // Malformed bearer token
+        const res1 = await getJson(`${testUrl}/api/v1/watchlist`, {
+          Authorization: "Basic invalid-credentials",
+        });
+        expect(res1.status).toBe(401);
+        expect(JSON.stringify(res1.body)).not.toContain(secretToken);
+
+        // Wrong token
+        const res2 = await getJson(`${testUrl}/api/v1/watchlist`, {
+          Authorization: "Bearer wrong-token-54321",
+        });
+        expect(res2.status).toBe(401);
+        expect(JSON.stringify(res2.body)).not.toContain(secretToken);
+        expect(JSON.stringify(res2.body)).not.toContain("wrong-token-54321");
+      } finally {
+        await secureServer.stop();
+      }
+    });
+
+    it("shuts down cleanly alongside keeper without leaving hanging handles", async () => {
+      const keeper = {
+        isRunning: () => true,
+        stop: vi.fn().mockResolvedValue(undefined),
+      };
+      const coServer = new HttpServer({
+        db,
+        logger,
+        port: 0,
+        host: "127.0.0.1",
+        isKeeperRunning: () => keeper.isRunning(),
+      });
+      const bound = await coServer.start();
+      expect(coServer.isListening()).toBe(true);
+
+      const healthRes = await getJson(`http://127.0.0.1:${bound.port}/health`);
+      expect(healthRes.body.data.keeperRunning).toBe(true);
+
+      // Simulate simultaneous component shutdown (as executed in CLI shutdown handler)
+      await Promise.allSettled([keeper.stop(), coServer.stop()]);
+      expect(coServer.isListening()).toBe(false);
+      expect(keeper.stop).toHaveBeenCalledTimes(1);
+
+      // Verify db is still open and uncorrupted
+      expect(() => db.listWatchlist()).not.toThrow();
+    });
+
     it("rejects non-GET and non-HEAD methods with 405 Method Not Allowed", async () => {
       const postRes = await requestRaw(`${baseUrl}/api/v1/watchlist`, "POST");
       expect(postRes.status).toBe(405);
