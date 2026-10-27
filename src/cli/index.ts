@@ -5,6 +5,7 @@ import { DatabaseClient } from "../db/client.js";
 import { createLogger } from "../logging/logger.js";
 import { KeeperDaemon } from "../monitoring/keeper.js";
 import { MonitoringService } from "../monitoring/monitoring-service.js";
+import { HttpServer } from "../server/index.js";
 import { reconstructLedgerKey } from "../watchlist/key-reconstructor.js";
 
 /**
@@ -190,14 +191,29 @@ export function createProgram(overrides?: Partial<AppConfig>): Command {
     .command("keeper:start")
     .description("Start the long-running keeper monitoring daemon")
     .action(async () => {
-      const { config, logger, monitoringService, db } = initContext();
+      const { config, logger, monitoringService, db, rpcClient } = initContext();
       const keeper = new KeeperDaemon({
         monitoringService,
         logger,
         intervalMs: config.monitoringIntervalMs,
       });
 
+      const server = new HttpServer({
+        db,
+        rpcClient,
+        logger,
+        port: config.apiPort,
+        host: config.apiHost,
+        network: config.network,
+        authToken: config.apiAuthToken,
+        corsOrigin: config.apiCorsOrigin,
+        isKeeperRunning: () => keeper.isRunning(),
+      });
+
       keeper.start();
+      void server.start().catch((err) => {
+        logger.error({ err }, "Failed to start HTTP API alongside keeper");
+      });
 
       let isShuttingDown = false;
       const shutdown = async (signal: string) => {
@@ -205,7 +221,7 @@ export function createProgram(overrides?: Partial<AppConfig>): Command {
         isShuttingDown = true;
         logger.info({ signal }, "Shutdown signal received. Performing graceful keeper cleanup...");
         try {
-          await keeper.stop();
+          await Promise.allSettled([keeper.stop(), server.stop()]);
           db.close();
           logger.info("Keeper resources closed cleanly.");
           process.exit(0);
@@ -226,7 +242,7 @@ export function createProgram(overrides?: Partial<AppConfig>): Command {
           "Uncaught exception in keeper process. Halting.",
         );
         try {
-          keeper.stop().finally(() => {
+          void Promise.allSettled([keeper.stop(), server.stop().catch(() => {})]).finally(() => {
             db.close();
             process.exit(1);
           });
@@ -305,6 +321,59 @@ export function createProgram(overrides?: Partial<AppConfig>): Command {
         console.error(`[Prune Error]: ${err instanceof Error ? err.message : String(err)}`);
         db.close();
         process.exitCode = 1;
+      }
+    });
+
+  // 9. server:start
+  program
+    .command("server:start")
+    .description("Start the standalone read-only HTTP API server for SoroTTL inspection")
+    .option("-p, --port <port>", "Port to bind HTTP server to")
+    .option("-h, --host <host>", "Host address to bind HTTP server to")
+    .action(async (opts) => {
+      const { config, logger, db, rpcClient } = initContext();
+      const port = opts.port ? Number(opts.port) : config.apiPort;
+      const host = opts.host || config.apiHost;
+
+      const server = new HttpServer({
+        db,
+        rpcClient,
+        logger,
+        port,
+        host,
+        network: config.network,
+        authToken: config.apiAuthToken,
+        corsOrigin: config.apiCorsOrigin,
+      });
+
+      try {
+        const bound = await server.start();
+        console.log(
+          `[HTTP API Ready] Listening on http://${bound.host}:${bound.port} (network: ${config.network})`,
+        );
+
+        let isShuttingDown = false;
+        const shutdown = async (signal: string) => {
+          if (isShuttingDown) return;
+          isShuttingDown = true;
+          logger.info({ signal }, "Shutting down HTTP API server...");
+          try {
+            await server.stop();
+            db.close();
+            process.exit(0);
+          } catch (err) {
+            logger.error({ err }, "Error during server shutdown");
+            db.close();
+            process.exit(1);
+          }
+        };
+
+        process.on("SIGINT", () => void shutdown("SIGINT"));
+        process.on("SIGTERM", () => void shutdown("SIGTERM"));
+      } catch (err) {
+        console.error(`[Server Start Error]: ${err instanceof Error ? err.message : String(err)}`);
+        db.close();
+        process.exit(1);
       }
     });
 
