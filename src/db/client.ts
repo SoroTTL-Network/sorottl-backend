@@ -183,17 +183,22 @@ export class DatabaseClient {
   }
 
   public listWatchlist(
-    filterOrNetwork?: string | { network?: string; enabledOnly?: boolean },
+    filterOrNetwork?:
+      string | { network?: string; enabledOnly?: boolean; limit?: number; offset?: number },
     enabledOnlyFlag: boolean = false,
   ): WatchlistRecord[] {
     let network: string | undefined;
     let enabledOnly = enabledOnlyFlag;
+    let limit: number | undefined;
+    let offset: number | undefined;
 
     if (typeof filterOrNetwork === "object" && filterOrNetwork !== null) {
       network = filterOrNetwork.network;
       if (filterOrNetwork.enabledOnly !== undefined) {
         enabledOnly = filterOrNetwork.enabledOnly;
       }
+      limit = filterOrNetwork.limit;
+      offset = filterOrNetwork.offset;
     } else if (typeof filterOrNetwork === "string") {
       network = filterOrNetwork;
     }
@@ -217,7 +222,20 @@ export class DatabaseClient {
     if (conditions.length > 0) {
       query += ` WHERE ${conditions.join(" AND ")}`;
     }
-    query += " ORDER BY id ASC;";
+    query += " ORDER BY id ASC";
+
+    if (limit !== undefined) {
+      query += " LIMIT ?";
+      params.push(limit);
+      if (offset !== undefined) {
+        query += " OFFSET ?";
+        params.push(offset);
+      }
+    } else if (offset !== undefined) {
+      query += " LIMIT -1 OFFSET ?";
+      params.push(offset);
+    }
+    query += ";";
 
     const stmt = this.db.prepare(query);
     const rows = stmt.all(...params) as Record<string, unknown>[];
@@ -292,6 +310,60 @@ export class DatabaseClient {
 
     const row = stmt.get(watchlistId) as Record<string, unknown> | undefined;
     return row ? this.mapObservationRow(row) : null;
+  }
+
+  public listObservations(
+    options: {
+      watchlistId?: number;
+      network?: string;
+      status?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ): TTLObservationRecord[] {
+    let query = `
+      SELECT id, watchlist_id as watchlistId, network, current_ledger as currentLedger,
+             live_until_ledger_seq as liveUntilLedgerSeq, remaining_ledgers as remainingLedgers,
+             last_modified_ledger_seq as lastModifiedLedgerSeq, status, durability, confidence,
+             reason, observed_at as observedAt
+      FROM ttl_observations
+    `;
+    const params: (string | number)[] = [];
+    const conditions: string[] = [];
+
+    if (options.watchlistId !== undefined) {
+      conditions.push("watchlist_id = ?");
+      params.push(options.watchlistId);
+    }
+    if (options.network !== undefined) {
+      conditions.push("network = ?");
+      params.push(options.network);
+    }
+    if (options.status !== undefined) {
+      conditions.push("status = ?");
+      params.push(options.status);
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ${conditions.join(" AND ")}`;
+    }
+
+    query += " ORDER BY id DESC";
+
+    const limit = options.limit !== undefined ? Math.max(1, Math.min(100, options.limit)) : 50;
+    query += " LIMIT ?";
+    params.push(limit);
+
+    if (options.offset !== undefined && options.offset > 0) {
+      query += " OFFSET ?";
+      params.push(options.offset);
+    }
+
+    query += ";";
+
+    const stmt = this.db.prepare(query);
+    const rows = stmt.all(...params) as Record<string, unknown>[];
+    return rows.map((r) => this.mapObservationRow(r));
   }
 
   public isAlertInCooldown(watchlistId: number, category: string, cooldownMs: number): boolean {
@@ -449,14 +521,38 @@ export class DatabaseClient {
     }
   }
 
-  public listAlerts(filterOrLimit: number | { watchlistId?: number } = 50): AlertRecord[] {
+  public listAlerts(
+    filterOrLimit:
+      | number
+      | {
+          watchlistId?: number;
+          network?: string;
+          category?: string;
+          deliveryStatus?: string;
+          limit?: number;
+          offset?: number;
+        } = 50,
+  ): AlertRecord[] {
     let limit = 50;
+    let offset = 0;
     let watchlistId: number | undefined;
+    let network: string | undefined;
+    let category: string | undefined;
+    let deliveryStatus: string | undefined;
 
     if (typeof filterOrLimit === "number") {
       limit = filterOrLimit;
     } else if (filterOrLimit && typeof filterOrLimit === "object") {
       watchlistId = filterOrLimit.watchlistId;
+      network = filterOrLimit.network;
+      category = filterOrLimit.category;
+      deliveryStatus = filterOrLimit.deliveryStatus;
+      if (filterOrLimit.limit !== undefined) {
+        limit = Math.max(1, Math.min(100, filterOrLimit.limit));
+      }
+      if (filterOrLimit.offset !== undefined) {
+        offset = Math.max(0, filterOrLimit.offset);
+      }
     }
 
     let query = `
@@ -467,12 +563,37 @@ export class DatabaseClient {
       FROM alerts
     `;
     const params: (string | number)[] = [];
+    const conditions: string[] = [];
+
     if (watchlistId !== undefined) {
-      query += ` WHERE watchlist_id = ?`;
+      conditions.push("watchlist_id = ?");
       params.push(watchlistId);
     }
-    query += ` ORDER BY id DESC LIMIT ?;`;
+    if (network !== undefined) {
+      conditions.push("network = ?");
+      params.push(network);
+    }
+    if (category !== undefined) {
+      conditions.push("category = ?");
+      params.push(category);
+    }
+    if (deliveryStatus !== undefined) {
+      conditions.push("delivery_status = ?");
+      params.push(deliveryStatus);
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ${conditions.join(" AND ")}`;
+    }
+
+    query += ` ORDER BY id DESC LIMIT ?`;
     params.push(limit);
+
+    if (offset > 0) {
+      query += ` OFFSET ?`;
+      params.push(offset);
+    }
+    query += ";";
 
     const stmt = this.db.prepare(query);
     const rows = stmt.all(...params) as Record<string, unknown>[];

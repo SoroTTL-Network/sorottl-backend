@@ -20,6 +20,14 @@ export const AppConfigSchema = z.object({
   alertCooldownMs: z.coerce.number().int().nonnegative().default(1800000),
   /** Optional webhook endpoint for external notification dispatch */
   alertWebhookUrl: z.string().url().optional(),
+  /** HTTP API port (default 8080) */
+  apiPort: z.coerce.number().int().min(1).max(65535).default(8080),
+  /** HTTP API host binding (default 127.0.0.1 for local security) */
+  apiHost: z.string().min(1).default("127.0.0.1"),
+  /** Optional Bearer token for API authentication */
+  apiAuthToken: z.string().min(1).optional(),
+  /** Allowed CORS origins (comma-separated, or single origin; default unset) */
+  apiCorsOrigin: z.string().optional(),
 });
 
 export type AppConfig = z.infer<typeof AppConfigSchema>;
@@ -50,6 +58,10 @@ export function loadConfig(overrides?: Partial<AppConfig>): AppConfig {
       ? Number(process.env["SOROTTL_ALERT_COOLDOWN_MS"])
       : 1800000,
     alertWebhookUrl: process.env["SOROTTL_ALERT_WEBHOOK_URL"] || undefined,
+    apiPort: process.env["SOROTTL_API_PORT"] ? Number(process.env["SOROTTL_API_PORT"]) : 8080,
+    apiHost: process.env["SOROTTL_API_HOST"] || "127.0.0.1",
+    apiAuthToken: process.env["SOROTTL_API_AUTH_TOKEN"] || undefined,
+    apiCorsOrigin: process.env["SOROTTL_API_CORS_ORIGIN"] || undefined,
   };
 
   const merged = { ...envConfig, ...(overrides ?? {}) };
