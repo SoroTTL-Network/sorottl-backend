@@ -1,6 +1,9 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   AlertCategory,
+  AlertDeliveryStatus,
   AlertRecord,
   CreateAlertInput,
   CreateObservationInput,
@@ -10,15 +13,32 @@ import type {
 } from "../types/domain.js";
 
 /**
+ * Current target database schema version.
+ */
+export const CURRENT_SCHEMA_VERSION = 2;
+
+/**
  * SQLite database client managing migrations and typed CRUD operations.
  */
 export class DatabaseClient {
   private readonly db: DatabaseSync;
 
   constructor(dbPath: string = ":memory:") {
+    if (dbPath !== ":memory:") {
+      const parentDir = path.dirname(path.resolve(dbPath));
+      if (!fs.existsSync(parentDir)) {
+        fs.mkdirSync(parentDir, { recursive: true });
+      }
+    }
+
     this.db = new DatabaseSync(dbPath);
-    this.initPragmas();
-    this.runMigrations();
+    try {
+      this.initPragmas();
+      this.runMigrations();
+    } catch (err) {
+      this.db.close();
+      throw err;
+    }
   }
 
   private initPragmas(): void {
@@ -26,61 +46,88 @@ export class DatabaseClient {
     this.db.exec("PRAGMA foreign_keys = ON;");
   }
 
+  private getSchemaVersion(): number {
+    const row = this.db.prepare("PRAGMA user_version;").get() as
+      Record<string, unknown> | undefined;
+    return row && typeof row["user_version"] === "number" ? row["user_version"] : 0;
+  }
+
+  private setSchemaVersion(version: number): void {
+    this.db.exec(`PRAGMA user_version = ${version};`);
+  }
+
   private runMigrations(): void {
-    // 1. Watchlist table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS watchlist (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        network TEXT NOT NULL,
-        label TEXT NOT NULL,
-        key_type TEXT NOT NULL,
-        key_xdr TEXT NOT NULL,
-        contract_id TEXT,
-        warning_threshold_ledgers INTEGER NOT NULL DEFAULT 5000,
-        enabled INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-        UNIQUE(network, key_xdr)
-      );
-      CREATE INDEX IF NOT EXISTS idx_watchlist_network_enabled ON watchlist(network, enabled);
-    `);
+    const currentVersion = this.getSchemaVersion();
 
-    // 2. Observations table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS ttl_observations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        watchlist_id INTEGER NOT NULL REFERENCES watchlist(id) ON DELETE CASCADE,
-        network TEXT NOT NULL,
-        current_ledger INTEGER NOT NULL,
-        live_until_ledger_seq INTEGER,
-        remaining_ledgers INTEGER,
-        last_modified_ledger_seq INTEGER,
-        status TEXT NOT NULL,
-        durability TEXT NOT NULL,
-        confidence TEXT NOT NULL,
-        reason TEXT,
-        observed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    if (currentVersion > CURRENT_SCHEMA_VERSION) {
+      throw new Error(
+        `Database schema version ${currentVersion} is newer than supported version ${CURRENT_SCHEMA_VERSION}. Please update the SoroTTL backend.`,
       );
-      CREATE INDEX IF NOT EXISTS idx_observations_watchlist_id ON ttl_observations(watchlist_id);
-      CREATE INDEX IF NOT EXISTS idx_observations_observed_at ON ttl_observations(observed_at);
-    `);
+    }
 
-    // 3. Alerts table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS alerts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        watchlist_id INTEGER REFERENCES watchlist(id) ON DELETE SET NULL,
-        network TEXT NOT NULL,
-        category TEXT NOT NULL,
-        title TEXT NOT NULL,
-        message TEXT NOT NULL,
-        payload_json TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        delivered INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE INDEX IF NOT EXISTS idx_alerts_watchlist_category ON alerts(watchlist_id, category);
-      CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);
-    `);
+    // Migration v1: Initial tables
+    if (currentVersion < 1) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS watchlist (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          network TEXT NOT NULL,
+          label TEXT NOT NULL,
+          key_type TEXT NOT NULL,
+          key_xdr TEXT NOT NULL,
+          contract_id TEXT,
+          warning_threshold_ledgers INTEGER NOT NULL DEFAULT 5000,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(network, key_xdr)
+        );
+        CREATE INDEX IF NOT EXISTS idx_watchlist_network_enabled ON watchlist(network, enabled);
+
+        CREATE TABLE IF NOT EXISTS ttl_observations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          watchlist_id INTEGER NOT NULL REFERENCES watchlist(id) ON DELETE CASCADE,
+          network TEXT NOT NULL,
+          current_ledger INTEGER NOT NULL,
+          live_until_ledger_seq INTEGER,
+          remaining_ledgers INTEGER,
+          last_modified_ledger_seq INTEGER,
+          status TEXT NOT NULL,
+          durability TEXT NOT NULL,
+          confidence TEXT NOT NULL,
+          reason TEXT,
+          observed_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_observations_watchlist_id ON ttl_observations(watchlist_id);
+        CREATE INDEX IF NOT EXISTS idx_observations_observed_at ON ttl_observations(observed_at);
+
+        CREATE TABLE IF NOT EXISTS alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          watchlist_id INTEGER REFERENCES watchlist(id) ON DELETE SET NULL,
+          network TEXT NOT NULL,
+          category TEXT NOT NULL,
+          title TEXT NOT NULL,
+          message TEXT NOT NULL,
+          payload_json TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          delivered INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_alerts_watchlist_category ON alerts(watchlist_id, category);
+        CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);
+      `);
+      this.setSchemaVersion(1);
+    }
+
+    // Migration v2: Explicit delivery status, attempts, and retention indexes
+    if (currentVersion < 2) {
+      this.db.exec(`
+        ALTER TABLE alerts ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'pending';
+        ALTER TABLE alerts ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE alerts ADD COLUMN last_delivery_error TEXT;
+        ALTER TABLE alerts ADD COLUMN delivered_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_alerts_delivery_status ON alerts(delivery_status);
+      `);
+      this.setSchemaVersion(2);
+    }
   }
 
   /**
@@ -267,10 +314,12 @@ export class DatabaseClient {
    */
   public recordAlert(input: CreateAlertInput): AlertRecord {
     const stmt = this.db.prepare(`
-      INSERT INTO alerts (watchlist_id, network, category, title, message, payload_json, created_at, delivered)
-      VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 0)
+      INSERT INTO alerts (watchlist_id, network, category, title, message, payload_json, created_at, delivered, delivery_status, delivery_attempts)
+      VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 0, 'pending', 0)
       RETURNING id, watchlist_id as watchlistId, network, category, title, message,
-                payload_json as payloadJson, created_at as createdAt, delivered;
+                payload_json as payloadJson, created_at as createdAt, delivered,
+                delivery_status as deliveryStatus, delivery_attempts as deliveryAttempts,
+                last_delivery_error as lastDeliveryError, delivered_at as deliveredAt;
     `);
 
     const row = stmt.get(
@@ -285,6 +334,82 @@ export class DatabaseClient {
     return this.mapAlertRow(row);
   }
 
+  /**
+   * Updates an alert's delivery outcome.
+   * If status is 'delivered', sets delivered = 1 and records delivered_at timestamp.
+   * If status is 'failed', increments delivery_attempts and records last_delivery_error.
+   */
+  public updateAlertDelivery(
+    alertId: number,
+    status: AlertDeliveryStatus,
+    errorMessage?: string,
+  ): boolean {
+    const isDelivered = status === "delivered" ? 1 : 0;
+    const deliveredAt = status === "delivered" ? new Date().toISOString() : null;
+
+    const stmt = this.db.prepare(`
+      UPDATE alerts
+      SET delivery_status = ?,
+          delivered = ?,
+          delivery_attempts = delivery_attempts + 1,
+          last_delivery_error = ?,
+          delivered_at = COALESCE(?, delivered_at)
+      WHERE id = ?;
+    `);
+
+    const res = stmt.run(status, isDelivered, errorMessage ?? null, deliveredAt, alertId);
+    return res.changes > 0;
+  }
+
+  /**
+   * Transactionally prunes TTL observation records older than the cutoff timestamp.
+   * Never prunes watchlist entries.
+   *
+   * @param cutoffIso - ISO string cutoff timestamp (records strictly older will be deleted)
+   * @returns Number of pruned observation records
+   */
+  public pruneObservations(cutoffIso: string): number {
+    this.db.exec("BEGIN TRANSACTION;");
+    try {
+      const stmt = this.db.prepare(`
+        DELETE FROM ttl_observations WHERE observed_at < ?;
+      `);
+      const res = stmt.run(cutoffIso);
+      this.db.exec("COMMIT;");
+      return Number(res.changes);
+    } catch (err) {
+      this.db.exec("ROLLBACK;");
+      throw err;
+    }
+  }
+
+  /**
+   * Transactionally prunes historical alerts older than the cutoff timestamp.
+   * STRICT SAFETY BOUNDARY:
+   * Only prunes alerts that have been successfully delivered ('delivered').
+   * NEVER prunes undelivered or pending alerts, regardless of age.
+   * NEVER prunes watchlist records.
+   *
+   * @param cutoffIso - ISO string cutoff timestamp
+   * @returns Number of pruned alert records
+   */
+  public pruneAlerts(cutoffIso: string): number {
+    this.db.exec("BEGIN TRANSACTION;");
+    try {
+      const stmt = this.db.prepare(`
+        DELETE FROM alerts
+        WHERE created_at < ?
+          AND (delivery_status = 'delivered' OR delivered = 1);
+      `);
+      const res = stmt.run(cutoffIso);
+      this.db.exec("COMMIT;");
+      return Number(res.changes);
+    } catch (err) {
+      this.db.exec("ROLLBACK;");
+      throw err;
+    }
+  }
+
   public listAlerts(filterOrLimit: number | { watchlistId?: number } = 50): AlertRecord[] {
     let limit = 50;
     let watchlistId: number | undefined;
@@ -297,7 +422,9 @@ export class DatabaseClient {
 
     let query = `
       SELECT id, watchlist_id as watchlistId, network, category, title, message,
-             payload_json as payloadJson, created_at as createdAt, delivered
+             payload_json as payloadJson, created_at as createdAt, delivered,
+             delivery_status as deliveryStatus, delivery_attempts as deliveryAttempts,
+             last_delivery_error as lastDeliveryError, delivered_at as deliveredAt
       FROM alerts
     `;
     const params: (string | number)[] = [];
@@ -376,6 +503,13 @@ export class DatabaseClient {
       payloadJson: row["payloadJson"] ? String(row["payloadJson"]) : null,
       createdAt: String(row["createdAt"]),
       delivered: Boolean(row["delivered"]),
+      deliveryStatus: (row["deliveryStatus"] as AlertDeliveryStatus) ?? "pending",
+      deliveryAttempts:
+        row["deliveryAttempts"] !== null && row["deliveryAttempts"] !== undefined
+          ? Number(row["deliveryAttempts"])
+          : 0,
+      lastDeliveryError: row["lastDeliveryError"] ? String(row["lastDeliveryError"]) : null,
+      deliveredAt: row["deliveredAt"] ? String(row["deliveredAt"]) : null,
     };
   }
 }

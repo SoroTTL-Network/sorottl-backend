@@ -55,6 +55,8 @@ export interface CreateObservationInput {
 export type AlertCategory =
   "low_ttl" | "ttl_reached" | "unknown_status" | "rpc_failure" | "config_failure";
 
+export type AlertDeliveryStatus = "pending" | "delivered" | "failed";
+
 export interface AlertRecord {
   readonly id: number;
   readonly watchlistId?: number | null;
@@ -65,6 +67,10 @@ export interface AlertRecord {
   readonly payloadJson?: string | null;
   readonly createdAt: string;
   readonly delivered: boolean;
+  readonly deliveryStatus?: AlertDeliveryStatus;
+  readonly deliveryAttempts?: number;
+  readonly lastDeliveryError?: string | null;
+  readonly deliveredAt?: string | null;
 }
 
 export interface CreateAlertInput {
