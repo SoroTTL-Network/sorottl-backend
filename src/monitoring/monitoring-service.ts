@@ -33,6 +33,7 @@ export class MonitoringService {
   private readonly alertCooldownMs: number;
   private readonly alertWebhookUrl?: string | undefined;
   private readonly concurrency: number;
+  private readonly activeDispatches: Set<number> = new Set();
 
   constructor(options: MonitoringServiceOptions) {
     this.db = options.db;
@@ -47,7 +48,7 @@ export class MonitoringService {
   /**
    * Runs a single, complete monitoring cycle across all enabled watchlist entries for this network.
    */
-  public async runMonitoringCycle(): Promise<MonitoringCycleSummary> {
+  public async runMonitoringCycle(signal?: AbortSignal): Promise<MonitoringCycleSummary> {
     const startedAt = new Date().toISOString();
     const cycleId = `cycle_${Date.now()}`;
     const startTime = Date.now();
@@ -83,9 +84,15 @@ export class MonitoringService {
         initialDelayMs: 250,
         maxDelayMs: 2000,
         maxTotalTimeoutMs: 6000,
+        signal,
       });
       this.logger.debug({ cycleId, currentLedger }, "Retrieved current ledger sequence snapshot");
     } catch (err) {
+      if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
+        this.logger.info({ cycleId }, "Monitoring cycle cancelled by abort signal.");
+        throw err;
+      }
+
       const errorMsg = err instanceof Error ? err.message : String(err);
       this.logger.error({ cycleId, err }, "Failed to retrieve latest ledger from Soroban RPC");
       this.maybeTriggerAlert(null, "rpc_failure", "Soroban RPC Unreachable", errorMsg);
@@ -114,8 +121,12 @@ export class MonitoringService {
     // 3. Process watchlist entries concurrently with bounded worker pool (per-key failure isolation)
     const results = await mapConcurrent(watchlist, this.concurrency, async (item) => {
       try {
-        return await this.processWatchlistItem(item, currentLedger);
+        return await this.processWatchlistItem(item, currentLedger, signal);
       } catch (err) {
+        if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
+          throw err;
+        }
+
         const errorMsg = err instanceof Error ? err.message : String(err);
         this.logger.error(
           { watchlistId: item.id, label: item.label, err },
@@ -174,6 +185,7 @@ export class MonitoringService {
   private async processWatchlistItem(
     item: WatchlistRecord,
     currentLedger: number,
+    signal?: AbortSignal,
   ): Promise<{ alertsCount: number; isError: boolean }> {
     // 1. Reconstruct SDK xdr.LedgerKey
     const { key } = reconstructLedgerKey(item.keyType, item.keyXdr, item.contractId);
@@ -186,8 +198,13 @@ export class MonitoringService {
         initialDelayMs: 200,
         maxDelayMs: 1500,
         maxTotalTimeoutMs: 5000,
+        signal,
       });
     } catch (err) {
+      if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
+        throw err;
+      }
+
       const errorMsg = err instanceof Error ? err.message : String(err);
       this.logger.warn(
         { watchlistId: item.id, label: item.label, err },
@@ -301,11 +318,72 @@ export class MonitoringService {
   }
 
   /**
+   * Reconciles eligible pending alerts left from previous crashed or aborted cycles.
+   * Runs bounded delivery without blocking regular monitoring cycles indefinitely.
+   *
+   * @param limit - Max pending alerts to reconcile in one pass (default: 25)
+   * @returns Number of successfully reconciled alerts
+   */
+  public async reconcilePendingAlerts(limit: number = 25): Promise<number> {
+    if (!this.alertWebhookUrl) return 0;
+
+    let pendingAlerts;
+    try {
+      pendingAlerts = this.db.getEligiblePendingAlerts(limit);
+    } catch (err) {
+      this.logger.error({ err }, "Failed to query eligible pending alerts for reconciliation");
+      return 0;
+    }
+
+    if (pendingAlerts.length === 0) return 0;
+
+    this.logger.info(
+      { count: pendingAlerts.length },
+      "Starting pending alert webhook reconciliation",
+    );
+
+    let deliveredCount = 0;
+    for (const alert of pendingAlerts) {
+      try {
+        const delivered = await this.dispatchWebhook(alert.id, alert.title, alert.message);
+        if (delivered) deliveredCount++;
+      } catch (err) {
+        this.logger.error({ alertId: alert.id, err }, "Unexpected error reconciling pending alert");
+      }
+    }
+
+    this.logger.info(
+      { deliveredCount, totalReconciled: pendingAlerts.length },
+      "Pending alert reconciliation finished",
+    );
+
+    return deliveredCount;
+  }
+
+  /**
    * Dispatches alert payload to configured webhook endpoint with bounded retries,
    * timeout (5000ms), and updates SQLite delivery status.
+   * Uses alertId in payload as stable idempotency key.
+   * Prevents concurrent dispatch of the same alertId within one process.
    */
-  public async dispatchWebhook(alertId: number, title: string, message: string): Promise<boolean> {
+  public async dispatchWebhook(
+    alertId: number,
+    title: string,
+    message: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     if (!this.alertWebhookUrl) return false;
+
+    // Prevent duplicate concurrent dispatch of the same alert
+    if (this.activeDispatches.has(alertId)) {
+      this.logger.warn(
+        { alertId },
+        "Webhook dispatch already active for alert. Skipping concurrent duplicate.",
+      );
+      return false;
+    }
+
+    this.activeDispatches.add(alertId);
 
     const payload = JSON.stringify({
       network: this.network,
@@ -320,9 +398,14 @@ export class MonitoringService {
         async () => {
           const response = await fetch(this.alertWebhookUrl!, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              "X-Idempotency-Key": `sorottl-alert-${alertId}`,
+            },
             body: payload,
-            signal: AbortSignal.timeout(5000),
+            signal: signal
+              ? AbortSignal.any([signal, AbortSignal.timeout(5000)])
+              : AbortSignal.timeout(5000),
           });
 
           if (!response.ok) {
@@ -335,18 +418,31 @@ export class MonitoringService {
           initialDelayMs: 300,
           maxDelayMs: 2000,
           maxTotalTimeoutMs: 6000,
+          signal,
         },
       );
 
       // Record successful delivery
-      this.db.updateAlertDelivery(alertId, "delivered");
+      try {
+        this.db.updateAlertDelivery(alertId, "delivered");
+      } catch (dbErr) {
+        this.logger.error({ alertId, dbErr }, "Database error recording delivered alert status");
+        throw dbErr;
+      }
+
       this.logger.debug({ alertId }, "Webhook delivered successfully");
       return true;
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      this.db.updateAlertDelivery(alertId, "failed", errorMsg);
+      try {
+        this.db.updateAlertDelivery(alertId, "failed", errorMsg);
+      } catch (dbErr) {
+        this.logger.error({ alertId, dbErr }, "Database error recording failed alert status");
+      }
       this.logger.warn({ alertId, errorMsg }, "Webhook delivery failed after retries");
       return false;
+    } finally {
+      this.activeDispatches.delete(alertId);
     }
   }
 }

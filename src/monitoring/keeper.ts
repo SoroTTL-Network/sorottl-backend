@@ -43,6 +43,13 @@ export class KeeperDaemon {
       "Keeper daemon started. Initiating periodic monitoring loop.",
     );
 
+    // Reconcile pending alerts from prior crashed runs in background without blocking keeper start
+    if (typeof this.monitoringService.reconcilePendingAlerts === "function") {
+      void this.monitoringService.reconcilePendingAlerts().catch((err) => {
+        this.logger.error({ err }, "Error during initial pending alert reconciliation");
+      });
+    }
+
     // Run first cycle immediately
     void this.runCycle();
 
@@ -98,8 +105,15 @@ export class KeeperDaemon {
 
     this.isCycleInProgress = true;
     try {
-      await this.monitoringService.runMonitoringCycle();
+      await this.monitoringService.runMonitoringCycle(this.abortController?.signal);
     } catch (err) {
+      if (
+        this.abortController?.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
+        this.logger.info("Cycle interrupted cleanly by shutdown signal.");
+        return;
+      }
       // The keeper must not crash or silently die from transient errors
       this.logger.error({ err }, "Unhandled error during keeper monitoring cycle");
     } finally {

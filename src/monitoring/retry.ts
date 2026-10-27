@@ -12,8 +12,50 @@ export interface RetryOptions {
   readonly maxTotalTimeoutMs?: number;
   /** Optional custom predicate to determine if an error is transient (retryable) */
   readonly isTransient?: (err: unknown) => boolean;
-  /** Optional sleeper function (defaults to setTimeout-based promise) */
-  readonly sleep?: (ms: number) => Promise<void>;
+  /** Optional sleeper function (defaults to setTimeout-based promise, signal-aware) */
+  readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Optional cancellation signal to promptly abort backoff sleep and retries */
+  readonly signal?: AbortSignal | undefined;
+}
+
+/**
+ * Default sleep function with prompt AbortSignal cancellation and cleanup.
+ */
+export function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error("Operation aborted"));
+      return;
+    }
+
+    let timeoutId: NodeJS.Timeout | null = null;
+    let abortListener: (() => void) | null = null;
+
+    const cleanup = () => {
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+      if (signal && abortListener !== null) {
+        signal.removeEventListener("abort", abortListener);
+        abortListener = null;
+      }
+    };
+
+    abortListener = () => {
+      cleanup();
+      reject(signal?.reason ?? new Error("Operation aborted"));
+    };
+
+    if (signal) {
+      signal.addEventListener("abort", abortListener, { once: true });
+    }
+
+    timeoutId = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+  });
 }
 
 /**
@@ -99,20 +141,34 @@ export async function withRetry<T>(
   operation: (attempt: number) => Promise<T>,
   options: RetryOptions = {},
 ): Promise<T> {
+  const signal = options.signal;
+  if (signal?.aborted) {
+    throw signal.reason ?? new Error("Operation aborted");
+  }
+
   const maxAttempts = options.maxAttempts ?? 3;
   const initialDelayMs = options.initialDelayMs ?? 200;
   const maxDelayMs = options.maxDelayMs ?? 2000;
   const maxTotalTimeoutMs = options.maxTotalTimeoutMs ?? 8000;
   const isTransient = options.isTransient ?? defaultIsTransientError;
-  const sleepFn = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const sleepFn = options.sleep ?? defaultSleep;
 
   const startTime = Date.now();
   let attempt = 1;
 
   while (true) {
+    if (signal?.aborted) {
+      throw signal.reason ?? new Error("Operation aborted");
+    }
+
     try {
       return await operation(attempt);
     } catch (err) {
+      // If the error was caused by cancellation, rethrow immediately without retrying
+      if (signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
+        throw err;
+      }
+
       const elapsedMs = Date.now() - startTime;
       const remainingTotalMs = maxTotalTimeoutMs - elapsedMs;
 
@@ -141,7 +197,7 @@ export async function withRetry<T>(
         throw err;
       }
 
-      await sleepFn(sleepDuration);
+      await sleepFn(sleepDuration, signal);
       attempt++;
     }
   }

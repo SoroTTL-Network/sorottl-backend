@@ -378,4 +378,144 @@ describe("MonitoringService", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("reconciles pending webhook alerts on startup without duplicates", async () => {
+    const entry = db.addWatchlistEntry({
+      network: "testnet",
+      label: "Pending Reconciliation Test",
+      keyType: "instance",
+      keyXdr: "BBBBFA==",
+    });
+
+    // Alert 1: Pending (eligible)
+    const alert1 = db.recordAlert({
+      watchlistId: entry.id,
+      network: "testnet",
+      category: "low_ttl",
+      title: "Pending Alert 1",
+      message: "Needs reconciliation",
+    });
+
+    // Alert 2: Already delivered (must not be resent)
+    const alert2 = db.recordAlert({
+      watchlistId: entry.id,
+      network: "testnet",
+      category: "low_ttl",
+      title: "Already Delivered Alert",
+      message: "Do not resend",
+    });
+    db.updateAlertDelivery(alert2.id, "delivered");
+
+    // Alert 3: Failed with exhausted attempts (attempts = 5, must not be resent)
+    const alert3 = db.recordAlert({
+      watchlistId: entry.id,
+      network: "testnet",
+      category: "low_ttl",
+      title: "Exhausted Alert",
+      message: "Exceeded max attempts",
+    });
+    db["db"].exec(
+      `UPDATE alerts SET delivery_attempts = 5, delivery_status = 'failed' WHERE id = ${alert3.id};`,
+    );
+
+    let sentAlertIds: number[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async (_url, opts) => {
+      const body = JSON.parse(opts.body as string);
+      sentAlertIds.push(body.alertId);
+      return { ok: true, status: 200, statusText: "OK" };
+    });
+
+    try {
+      const mockRpc: ISoroRpcClient = {
+        getLatestLedger: vi.fn(),
+        getLatestLedgerSequence: vi.fn().mockResolvedValue(100),
+        getLedgerEntry: vi.fn(),
+        getLedgerEntries: vi.fn(),
+        getLedgerEntriesBatch: vi.fn(),
+        simulateTransaction: vi.fn(),
+        sendTransaction: vi.fn(),
+        getTransaction: vi.fn(),
+        getHealth: vi.fn(),
+      };
+
+      const service = new MonitoringService({
+        db,
+        rpcClient: mockRpc,
+        logger,
+        network: "testnet",
+        alertWebhookUrl: "https://example.com/webhook",
+      });
+
+      const reconciledCount = await service.reconcilePendingAlerts(10);
+      expect(reconciledCount).toBe(1);
+      expect(sentAlertIds).toEqual([alert1.id]);
+
+      // Verify alert 1 is now marked delivered in DB
+      const freshAlert1 = db.listAlerts({ watchlistId: entry.id }).find((a) => a.id === alert1.id);
+      expect(freshAlert1?.deliveryStatus).toBe("delivered");
+      expect(freshAlert1?.delivered).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("prevents concurrent dispatch of the same alert ID within one process", async () => {
+    const entry = db.addWatchlistEntry({
+      network: "testnet",
+      label: "Concurrent Dedup Test",
+      keyType: "instance",
+      keyXdr: "CCCCFA==",
+    });
+
+    const alert = db.recordAlert({
+      watchlistId: entry.id,
+      network: "testnet",
+      category: "low_ttl",
+      title: "Concurrent Alert",
+      message: "Testing dedup lock",
+    });
+
+    let fetchCount = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation(async () => {
+      fetchCount++;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { ok: true, status: 200, statusText: "OK" };
+    });
+
+    try {
+      const mockRpc: ISoroRpcClient = {
+        getLatestLedger: vi.fn(),
+        getLatestLedgerSequence: vi.fn().mockResolvedValue(100),
+        getLedgerEntry: vi.fn(),
+        getLedgerEntries: vi.fn(),
+        getLedgerEntriesBatch: vi.fn(),
+        simulateTransaction: vi.fn(),
+        sendTransaction: vi.fn(),
+        getTransaction: vi.fn(),
+        getHealth: vi.fn(),
+      };
+
+      const service = new MonitoringService({
+        db,
+        rpcClient: mockRpc,
+        logger,
+        network: "testnet",
+        alertWebhookUrl: "https://example.com/webhook",
+      });
+
+      // Launch two simultaneous dispatches for the same alert
+      const [res1, res2] = await Promise.all([
+        service.dispatchWebhook(alert.id, alert.title, alert.message),
+        service.dispatchWebhook(alert.id, alert.title, alert.message),
+      ]);
+
+      // Exactly one should dispatch; the other should detect active dispatch and return false
+      expect(fetchCount).toBe(1);
+      expect([res1, res2].filter(Boolean)).toHaveLength(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
