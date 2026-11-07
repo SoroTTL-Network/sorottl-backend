@@ -1,0 +1,45 @@
+# ==============================================================================
+# Render Blueprint Specification for SoroTTL Backend
+#
+# Production Web Service hosting SoroTTL Keeper Daemon & Read-Only HTTP API.
+# Utilizes a Render Persistent Disk (/var/data) for single-service SQLite WAL storage.
+# ==============================================================================
+
+services:
+  - type: web
+    name: sorottl-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter # Starter plan or higher is required for Render persistent disks
+    region: oregon # or frankfurt, ohio, singapore
+    healthCheckPath: /health/ready
+    disk:
+      name: sorottl-data
+      mountPath: /var/data
+      sizeGB: 10
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SOROTTL_NETWORK
+        value: testnet # or mainnet
+      - key: SOROTTL_RPC_URL
+        value: https://soroban-testnet.stellar.org # or https://mainnet.sorobanrpc.com
+      - key: SOROTTL_DB_PATH
+        value: /var/data/sorottl.db
+      - key: SOROTTL_API_HOST
+        value: 0.0.0.0
+      - key: SOROTTL_LOG_LEVEL
+        value: info
+      - key: SOROTTL_MONITORING_INTERVAL_MS
+        value: "30000"
+      - key: SOROTTL_DEFAULT_WARNING_THRESHOLD_LEDGERS
+        value: "10000"
+      - key: SOROTTL_ALERT_COOLDOWN_MS
+        value: "1800000"
+      - key: SOROTTL_API_AUTH_TOKEN
+        generateValue: true # Render automatically generates a secure 32-char Bearer secret
+      # - key: SOROTTL_ALERT_WEBHOOK_URL
+      #   sync: false # Set manually in Render Dashboard if using Slack/Discord alerts
+      # - key: SOROTTL_API_CORS_ORIGIN
+      #   sync: false # Set to your dashboard URL (e.g. https://dashboard.sorottl.network)
