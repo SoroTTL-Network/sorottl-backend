@@ -3,32 +3,48 @@ import { z } from "zod";
 /**
  * Zod schema defining backend and keeper configuration.
  */
-export const AppConfigSchema = z.object({
-  /** Stellar network: 'testnet' or 'mainnet' (never silently falls back) */
-  network: z.enum(["testnet", "mainnet"]),
-  /** Soroban RPC URL override */
-  rpcUrl: z.string().url(),
-  /** SQLite database file path */
-  dbPath: z.string().min(1).default("./sorottl.db"),
-  /** Logging verbosity */
-  logLevel: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
-  /** Periodic monitoring interval in milliseconds (default 30s) */
-  monitoringIntervalMs: z.coerce.number().int().positive().default(30000),
-  /** Default warning threshold in ledgers (e.g. 10000 ledgers) */
-  defaultWarningThresholdLedgers: z.coerce.number().int().nonnegative().default(10000),
-  /** Alert suppression cooldown window in milliseconds (default 30 minutes) */
-  alertCooldownMs: z.coerce.number().int().nonnegative().default(1800000),
-  /** Optional webhook endpoint for external notification dispatch */
-  alertWebhookUrl: z.string().url().optional(),
-  /** HTTP API port (default 8080) */
-  apiPort: z.coerce.number().int().min(1).max(65535).default(8080),
-  /** HTTP API host binding (default 127.0.0.1 for local security) */
-  apiHost: z.string().min(1).default("127.0.0.1"),
-  /** Optional Bearer token for API authentication */
-  apiAuthToken: z.string().min(1).optional(),
-  /** Allowed CORS origins (comma-separated, or single origin; default unset) */
-  apiCorsOrigin: z.string().optional(),
-});
+export const AppConfigSchema = z
+  .object({
+    /** Node environment: development, test, or production */
+    nodeEnv: z.enum(["development", "test", "production"]).default("development"),
+    /** Stellar network: 'testnet' or 'mainnet' (never silently falls back) */
+    network: z.enum(["testnet", "mainnet"]),
+    /** Soroban RPC URL override */
+    rpcUrl: z.string().url(),
+    /** SQLite database file path */
+    dbPath: z.string().min(1).default("./sorottl.db"),
+    /** Logging verbosity */
+    logLevel: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
+    /** Periodic monitoring interval in milliseconds (default 30s) */
+    monitoringIntervalMs: z.coerce.number().int().positive().default(30000),
+    /** Default warning threshold in ledgers (e.g. 10000 ledgers) */
+    defaultWarningThresholdLedgers: z.coerce.number().int().nonnegative().default(10000),
+    /** Alert suppression cooldown window in milliseconds (default 30 minutes) */
+    alertCooldownMs: z.coerce.number().int().nonnegative().default(1800000),
+    /** Optional webhook endpoint for external notification dispatch */
+    alertWebhookUrl: z.string().url().optional(),
+    /** HTTP API port (default 8080, supports Render's PORT) */
+    apiPort: z.coerce.number().int().min(1).max(65535).default(8080),
+    /** HTTP API host binding (default 127.0.0.1 for local, 0.0.0.0 in Docker/Render) */
+    apiHost: z.string().min(1).default("127.0.0.1"),
+    /** Optional Bearer token for API authentication */
+    apiAuthToken: z.string().min(1).optional(),
+    /** Allowed CORS origins (comma-separated, or single origin; default unset) */
+    apiCorsOrigin: z.string().optional(),
+  })
+  .superRefine((data, ctx) => {
+    // In production environments, protect against ephemeral database loss
+    if (data.nodeEnv === "production") {
+      if (data.dbPath === ":memory:") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["dbPath"],
+          message:
+            "In-memory SQLite (:memory:) is forbidden in production. Configure a persistent disk path (e.g., /var/data/sorottl.db).",
+        });
+      }
+    }
+  });
 
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 
@@ -37,7 +53,18 @@ export type AppConfig = z.infer<typeof AppConfigSchema>;
  * Strictly validates network and settings without falling back.
  */
 export function loadConfig(overrides?: Partial<AppConfig>): AppConfig {
+  const nodeEnv = (process.env["NODE_ENV"] || "development") as
+    "development" | "test" | "production";
+
+  // Render automatically assigns PORT; support both PORT and SOROTTL_API_PORT
+  const rawPort = process.env["PORT"] || process.env["SOROTTL_API_PORT"];
+  const apiPort = rawPort ? Number(rawPort) : 8080;
+
+  // Support SOROTTL_API_HOST, defaulting to 127.0.0.1 locally or when unset
+  const apiHost = process.env["SOROTTL_API_HOST"] || "127.0.0.1";
+
   const envConfig = {
+    nodeEnv,
     network: (process.env["SOROTTL_NETWORK"] || "testnet") as "testnet" | "mainnet",
     rpcUrl:
       process.env["SOROTTL_RPC_URL"] ||
@@ -58,8 +85,8 @@ export function loadConfig(overrides?: Partial<AppConfig>): AppConfig {
       ? Number(process.env["SOROTTL_ALERT_COOLDOWN_MS"])
       : 1800000,
     alertWebhookUrl: process.env["SOROTTL_ALERT_WEBHOOK_URL"] || undefined,
-    apiPort: process.env["SOROTTL_API_PORT"] ? Number(process.env["SOROTTL_API_PORT"]) : 8080,
-    apiHost: process.env["SOROTTL_API_HOST"] || "127.0.0.1",
+    apiPort,
+    apiHost,
     apiAuthToken: process.env["SOROTTL_API_AUTH_TOKEN"] || undefined,
     apiCorsOrigin: process.env["SOROTTL_API_CORS_ORIGIN"] || undefined,
   };
