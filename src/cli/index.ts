@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { SoroRpcClient, getNetworkConfig } from "@sorottl/sdk";
 import { Command } from "commander";
 import { type AppConfig, loadConfig } from "../config/index.js";
@@ -378,4 +379,27 @@ export function createProgram(overrides?: Partial<AppConfig>): Command {
     });
 
   return program;
+}
+
+// Auto-run CLI when executed directly via node dist/cli/index.js or CLI bin entry
+function isExecutedDirectly(): boolean {
+  if (typeof process === "undefined" || !process.argv || !process.argv[1]) {
+    return false;
+  }
+  if (process.env["VITEST"]) {
+    return false;
+  }
+  const entry = process.argv[1];
+  const base = path.basename(entry);
+  const dir = path.basename(path.dirname(entry));
+
+  // Matches 'sorottl' binary or 'cli/index.js' / 'cli/index.mjs' / 'cli/index.ts'
+  return (
+    base === "sorottl" ||
+    (dir === "cli" && (base === "index.js" || base === "index.mjs" || base === "index.ts"))
+  );
+}
+
+if (isExecutedDirectly()) {
+  createProgram().parse(process.argv);
 }
