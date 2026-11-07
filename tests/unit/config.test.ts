@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { loadConfig } from "../../src/config/index.js";
 
-describe("Configuration Loader", () => {
+describe("Configuration Loader & Render Compatibility", () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
@@ -16,15 +16,54 @@ describe("Configuration Loader", () => {
     delete process.env.SOROTTL_NETWORK;
     delete process.env.SOROTTL_RPC_URL;
     delete process.env.SOROTTL_DB_PATH;
+    delete process.env.PORT;
+    delete process.env.SOROTTL_API_PORT;
+    delete process.env.SOROTTL_API_HOST;
 
     const config = loadConfig();
     expect(config.network).toBe("testnet");
     expect(config.rpcUrl).toBe("https://soroban-testnet.stellar.org");
     expect(config.dbPath).toBe("./sorottl.db");
+    expect(config.apiPort).toBe(8080);
+    expect(config.apiHost).toBe("127.0.0.1");
     expect(config.monitoringIntervalMs).toBe(30000);
     expect(config.alertCooldownMs).toBe(1800000);
     expect(config.defaultWarningThresholdLedgers).toBe(10000);
     expect(config.logLevel).toBe("info");
+  });
+
+  it("prioritizes Render's dynamic PORT environment variable", () => {
+    delete process.env.SOROTTL_API_PORT;
+    process.env.PORT = "10000";
+    process.env.SOROTTL_API_HOST = "0.0.0.0";
+
+    const config = loadConfig();
+    expect(config.apiPort).toBe(10000);
+    expect(config.apiHost).toBe("0.0.0.0");
+  });
+
+  it("allows SOROTTL_API_PORT to override port when PORT is unset", () => {
+    delete process.env.PORT;
+    process.env.SOROTTL_API_PORT = "9090";
+
+    const config = loadConfig();
+    expect(config.apiPort).toBe(9090);
+  });
+
+  it("forbids ephemeral in-memory SQLite in production", () => {
+    process.env.NODE_ENV = "production";
+    process.env.SOROTTL_DB_PATH = ":memory:";
+
+    expect(() => loadConfig()).toThrow("In-memory SQLite (:memory:) is forbidden in production");
+  });
+
+  it("accepts persistent disk path in production", () => {
+    process.env.NODE_ENV = "production";
+    process.env.SOROTTL_DB_PATH = "/var/data/sorottl.db";
+
+    const config = loadConfig();
+    expect(config.nodeEnv).toBe("production");
+    expect(config.dbPath).toBe("/var/data/sorottl.db");
   });
 
   it("loads mainnet configuration with explicit overrides", () => {
