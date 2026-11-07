@@ -32,7 +32,7 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "@sorottl/sdk": "file:../sorottl-sdk",
+    "@sorottl/sdk": "^0.1.0",
     "@stellar/stellar-sdk": "^17.4.0",
     "commander": "^13.1.0",
     "dotenv": "^16.4.7",
